@@ -1,0 +1,101 @@
+# ---------------------------------------------------------------------------
+# Model weights and checkpoints — far too large for git.
+#   models/  ~6.1 GB  the INT4 (sdnq) Z-Image-Turbo checkpoint
+#   weights/ ~1.2 GB  the original bf16/fp8 shards
+# Re-fetch with ./fetch_int4_model.sh and ./download_weights.sh
+# ---------------------------------------------------------------------------
+models/
+weights/
+
+# ---------------------------------------------------------------------------
+# Python environment
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# ---------------------------------------------------------------------------
+# Generated images and their metadata sidecars
+#   outputs/ holds every PNG the pipeline has produced plus a JSON per image.
+#   The directory itself is tracked (empty, via .gitkeep) so the layout is
+#   visible in a clone, but every generated file inside it is ignored.
+# ---------------------------------------------------------------------------
+outputs/*
+!outputs/.gitkeep
+*.png
+!frontend/public/*.png
+!frontend/src/assets/*.png
+*.jpg
+*.jpeg
+*.webp
+!frontend/public/favicon.svg
+*.gif
+
+# ---------------------------------------------------------------------------
+# Node / frontend
+# ---------------------------------------------------------------------------
+node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.local
+
+# ---------------------------------------------------------------------------
+# Secrets and local configuration
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets.json
+credentials.json
+config.local.json
+config.local.*
+local_settings.json
+
+# ---------------------------------------------------------------------------
+# Editor / OS / tooling
+# ---------------------------------------------------------------------------
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# ---------------------------------------------------------------------------
+# Test and scratch artifacts
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+test-results/
+playwright-report/
+/tmp/
+*.log
+scratch/
+
+# ---------------------------------------------------------------------------
+# Local notes
+# ---------------------------------------------------------------------------
+TODO.local.md
+NOTES.local.md
