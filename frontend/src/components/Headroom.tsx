@@ -82,12 +82,9 @@ export function Headroom({
       </div>
 
       <p className="text-[11px] leading-relaxed text-muted-foreground/80">
-        {!pred.encode_fits
-          ? "The prompt encoder alone does not fit on the card right now — close something else using VRAM, or the job will fail at the encode step."
-          : pred.binding === "vae"
-            ? "The VAE decode is the limit here, not the transformer — a larger resolution is what costs you, not the offload settings."
-            : "The transformer dominates, so a larger resolution is what costs you here."}
-        {warn && " This is very close to the card limit."}
+        {pred.binding === "vae"
+          ? "The VAE decode is the limit here, not the transformer — a larger resolution is what costs you, not the offload settings."
+          : "The transformer dominates, so a larger resolution is what costs you here."}
       </p>
     </div>
   )
