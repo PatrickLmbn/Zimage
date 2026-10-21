@@ -105,7 +105,7 @@ _PACKED_BLOCK_MIB = 97.3  # packed weight of one transformer block
 # "tight": the job will succeed, but the request will be slow.
 #
 # The generation phase is what actually decides whether the job fits.
-ENCODER_GPU_REQUIRED_FREE_MIB: float = 2850.0  # GPU encode needs this much free
+ENCODER_GPU_REQUIRED_FREE_MIB: float = 2840.0  # GPU encode needs this much free
 ENCODER_GPU_PEAK_MIB: float = 2800.0           # what the GPU encode occupies
 CPU_ENCODE_SECONDS: float = 17.0
 GPU_ENCODE_SECONDS: float = 1.0
