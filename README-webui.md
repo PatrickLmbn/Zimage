@@ -98,9 +98,11 @@ cd frontend && npm run dev
   the in-memory job when the backend is still running it and falls back to
   the sidecar otherwise, so prompts and metrics survive a backend restart.
 - **Delete from the gallery.** Hovering a gallery card reveals a trash button
-  in its top-right corner. It removes the PNG and the sidecar, and the gallery
-  refreshes. A job that is still generating is refused by the backend
-  (`busy`), and the UI shows the reason.
+  in its top-right corner; a checkbox in its top-left corner selects it. A
+  "Select all" checkbox sits above the grid, and selecting images reveals a
+  "Delete N" button. Bulk delete asks for confirmation first — it removes the
+  PNGs and the sidecars permanently, with no undo. A job that is still
+  generating is refused by the backend (`busy`), and the UI shows the reason.
 
 ## Memory strategy (why it fits in 4 GB VRAM / 16 GB RAM)
 

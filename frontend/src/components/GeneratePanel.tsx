@@ -15,6 +15,18 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog"
 import { Progress } from "@/components/ui/progress"
+import { Checkbox } from "@/components/ui/checkbox"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { Headroom } from "@/components/Headroom"
 import {
@@ -455,6 +467,23 @@ export function GalleryGrid({
 }) {
   const [busyId, setBusyId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [bulkBusy, setBulkBusy] = useState(false)
+
+  const toggle = (jobId: string, checked: boolean) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (checked) next.add(jobId)
+      else next.delete(jobId)
+      return next
+    })
+  }
+
+  const allSelected = items.length > 0 && items.every((i) => selected.has(i.job_id))
+
+  const toggleAll = (checked: boolean) => {
+    setSelected(checked ? new Set(items.map((i) => i.job_id)) : new Set())
+  }
 
   const remove = async (jobId: string) => {
     setBusyId(jobId)
@@ -465,11 +494,52 @@ export function GalleryGrid({
         const body = await res.json().catch(() => null)
         throw new Error(body?.detail ?? `HTTP ${res.status}`)
       }
+      setSelected((prev) => {
+        const next = new Set(prev)
+        next.delete(jobId)
+        return next
+      })
       onChanged()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusyId(null)
+    }
+  }
+
+  const removeSelected = async () => {
+    const ids = [...selected]
+    if (ids.length === 0) return
+    setBulkBusy(true)
+    setError(null)
+    try {
+      const res = await fetch("/api/images/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ job_ids: ids }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => null)
+        throw new Error(body?.detail ?? `HTTP ${res.status}`)
+      }
+      const result = (await res.json()) as {
+        deleted: string[]
+        missing: string[]
+        busy: string[]
+        count: number
+      }
+      if (result.busy.length > 0) {
+        setError(
+          `${result.busy.length} image${result.busy.length === 1 ? "" : "s"} still generating — skipped`,
+        )
+      }
+      // Keep the still-running ones selected so the user can retry them.
+      setSelected(new Set(result.busy))
+      onChanged()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBulkBusy(false)
     }
   }
 
@@ -482,6 +552,52 @@ export function GalleryGrid({
   }
   return (
     <div className="flex flex-col gap-3">
+      <div className="flex items-center gap-3">
+        <label className="flex items-center gap-2 text-xs text-muted-foreground select-none">
+          <Checkbox
+            checked={allSelected}
+            indeterminate={selected.size > 0 && !allSelected}
+            onCheckedChange={toggleAll}
+            aria-label="Select all images"
+          />
+          {selected.size > 0
+            ? `${selected.size} selected`
+            : "Select all"}
+        </label>
+        {selected.size > 0 && (
+          <AlertDialog>
+            <AlertDialogTrigger
+              render={
+                <Button variant="destructive" size="sm" disabled={bulkBusy} />
+              }
+            >
+              {bulkBusy ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : (
+                <Trash2 className="size-3.5" />
+              )}
+              Delete {selected.size}
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>
+                  Delete {selected.size} image{selected.size === 1 ? "" : "s"}?
+                </AlertDialogTitle>
+                <AlertDialogDescription>
+                  This permanently removes the image files from disk. It cannot be
+                  undone.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction onClick={removeSelected}>
+                  Delete
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        )}
+      </div>
       {error && (
         <p className="text-xs text-destructive break-words">{error}</p>
       )}
@@ -491,7 +607,11 @@ export function GalleryGrid({
           key={item.job_id}
           className={cn(
             "group relative overflow-hidden rounded-lg border bg-background transition-colors",
-            item.job_id === activeId ? "border-foreground" : "border-border",
+            selected.has(item.job_id)
+              ? "border-foreground"
+              : item.job_id === activeId
+                ? "border-foreground"
+                : "border-border",
           )}
         >
           <Dialog>
@@ -535,6 +655,16 @@ export function GalleryGrid({
               />
             </DialogContent>
           </Dialog>
+          <label
+            className="absolute top-2 left-2 flex size-8 cursor-pointer items-center justify-center rounded-md border border-border bg-background/80 backdrop-blur transition-opacity group-hover:opacity-100 focus-within:opacity-100"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <Checkbox
+              checked={selected.has(item.job_id)}
+              onCheckedChange={(checked) => toggle(item.job_id, checked)}
+              aria-label={`Select image ${item.job_id}`}
+            />
+          </label>
           <Button
             variant="secondary"
             size="icon"
