@@ -43,6 +43,8 @@ cd frontend && npm run dev
 | DELETE | `/api/jobs/{id}` | cancel a job (queued: immediate; running: next step) |
 | GET | `/api/image/{id}` | generated PNG |
 | GET | `/api/gallery` | all generated images with prompt + metrics, newest first |
+| DELETE | `/api/images/{id}` | delete one image + its sidecar (refuses if the job is running) |
+| POST | `/api/images/delete` | bulk delete: `{"job_ids": [...]}` → `{deleted, missing, busy, count}` |
 
 ## UI behaviour
 
@@ -93,8 +95,12 @@ cd frontend && npm run dev
   pinned and reachable.
 - **Durable gallery metadata.** Each finished job writes a
   `outputs/web_<jobid>.json` sidecar next to its PNG. `/api/gallery` reads
-  the in-memory job when the backend is still running it and falls back to the
-  sidecar otherwise, so prompts and metrics survive a backend restart.
+  the in-memory job when the backend is still running it and falls back to
+  the sidecar otherwise, so prompts and metrics survive a backend restart.
+- **Delete from the gallery.** Hovering a gallery card reveals a trash button
+  in its top-right corner. It removes the PNG and the sidecar, and the gallery
+  refreshes. A job that is still generating is refused by the backend
+  (`busy`), and the UI shows the reason.
 
 ## Memory strategy (why it fits in 4 GB VRAM / 16 GB RAM)
 

@@ -177,7 +177,7 @@ export default function App() {
               </Button>
             </div>
             <ScrollArea className="min-h-0 flex-1 pr-3">
-              <GalleryGrid items={gallery} activeId={activeId} />
+              <GalleryGrid items={gallery} activeId={activeId} onChanged={refreshGallery} />
             </ScrollArea>
           </section>
 

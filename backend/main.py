@@ -565,6 +565,8 @@ app = FastAPI(title="Z-Image-Turbo INT4 (RTX 2050)", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+    # LAN / Tailscale access: any host on the Vite dev port.
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1|192\.168\.\d{1,3}\.\d{1,3}|100\.\d{1,3}\.\d{1,3}\.\d{1,3}):5173",
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -732,6 +734,69 @@ def gallery() -> list[dict[str, Any]]:
             }
         )
     return items
+
+
+@app.delete("/api/images/{job_id}")
+def delete_image(job_id: str) -> dict[str, Any]:
+    """Delete one generated image and its sidecar metadata."""
+    return _delete_images([job_id])
+
+
+@app.post("/api/images/delete")
+def delete_images(payload: dict[str, Any]) -> dict[str, Any]:
+    """Bulk delete: ``{"job_ids": ["...", "..."]}``.
+
+    Returns ``{"deleted": [...], "missing": [...], "busy": [...], "count": n}``
+    so the UI can report exactly what happened.
+    """
+    ids = payload.get("job_ids") or []
+    if not isinstance(ids, list):
+        raise HTTPException(status_code=400, detail="job_ids must be a list")
+    return _delete_images([str(i) for i in ids])
+
+
+def _safe_job_id(job_id: str) -> bool:
+    """Job ids are hex-ish stems; anything else could escape OUT_DIR."""
+    return bool(job_id) and len(job_id) <= 64 and all(
+        ch.isalnum() or ch in "-_" for ch in job_id
+    )
+
+
+def _delete_images(job_ids: list[str]) -> dict[str, Any]:
+    """Remove PNGs + sidecars. Refuses to delete a job that is still running."""
+    deleted: list[str] = []
+    missing: list[str] = []
+    busy: list[str] = []
+    for job_id in job_ids:
+        if not _safe_job_id(job_id):
+            raise HTTPException(status_code=400, detail=f"invalid job id: {job_id!r}")
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if job is not None and job.state in ("queued", "running"):
+                busy.append(job_id)
+                continue
+        png = OUT_DIR / f"web_{job_id}.png"
+        meta = meta_path(job_id)
+        if not png.exists() and not meta.exists():
+            missing.append(job_id)
+            continue
+        try:
+            png.unlink(missing_ok=True)
+            meta.unlink(missing_ok=True)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500, detail=f"could not delete {job_id}: {exc}"
+            ) from exc
+        with JOBS_LOCK:
+            JOBS.pop(job_id, None)
+        deleted.append(job_id)
+        log(f"deleted image {job_id}")
+    return {
+        "deleted": deleted,
+        "missing": missing,
+        "busy": busy,
+        "count": len(deleted),
+    }
 
 
 @app.delete("/api/jobs/{job_id}")

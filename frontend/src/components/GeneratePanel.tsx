@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react"
-import { CircleAlert, Loader2, Send, Square, X, ZoomIn } from "lucide-react"
+import { CircleAlert, Loader2, Send, Square, Trash2, X, ZoomIn } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
@@ -447,10 +447,32 @@ export function GeneratePanel({
 export function GalleryGrid({
   items,
   activeId,
+  onChanged,
 }: {
   items: GalleryItem[]
   activeId: string | null
+  onChanged: () => void
 }) {
+  const [busyId, setBusyId] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  const remove = async (jobId: string) => {
+    setBusyId(jobId)
+    setError(null)
+    try {
+      const res = await fetch(`/api/images/${jobId}`, { method: "DELETE" })
+      if (!res.ok) {
+        const body = await res.json().catch(() => null)
+        throw new Error(body?.detail ?? `HTTP ${res.status}`)
+      }
+      onChanged()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusyId(null)
+    }
+  }
+
   if (items.length === 0) {
     return (
       <div className="flex h-full min-h-40 items-center justify-center rounded-lg border border-dashed border-border">
@@ -459,12 +481,16 @@ export function GalleryGrid({
     )
   }
   return (
-    <div className="grid grid-cols-1 gap-5 sm:grid-cols-2">
+    <div className="flex flex-col gap-3">
+      {error && (
+        <p className="text-xs text-destructive break-words">{error}</p>
+      )}
+      <div className="grid grid-cols-1 gap-5 sm:grid-cols-2">
       {items.map((item) => (
         <figure
           key={item.job_id}
           className={cn(
-            "overflow-hidden rounded-lg border bg-background transition-colors",
+            "group relative overflow-hidden rounded-lg border bg-background transition-colors",
             item.job_id === activeId ? "border-foreground" : "border-border",
           )}
         >
@@ -509,6 +535,20 @@ export function GalleryGrid({
               />
             </DialogContent>
           </Dialog>
+          <Button
+            variant="secondary"
+            size="icon"
+            aria-label="Delete image"
+            disabled={busyId === item.job_id}
+            onClick={() => remove(item.job_id)}
+            className="absolute top-2 right-2 size-8 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 disabled:opacity-50"
+          >
+            {busyId === item.job_id ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <Trash2 className="size-4" />
+            )}
+          </Button>
           <figcaption className="flex flex-col gap-1.5 px-3.5 py-3">
             <p
               className={cn(
@@ -533,6 +573,7 @@ export function GalleryGrid({
           </figcaption>
         </figure>
       ))}
+      </div>
     </div>
   )
 }
