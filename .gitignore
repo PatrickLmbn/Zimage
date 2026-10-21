@@ -99,3 +99,10 @@ scratch/
 # ---------------------------------------------------------------------------
 TODO.local.md
 NOTES.local.md
+
+# ---------------------------------------------------------------------------
+# Local architecture write-up. Machine-specific: it documents the measured
+# RAM/VRAM/SSD split and the PCIe behaviour of THIS box, which is not useful
+# to anyone who clones the repo.
+# ---------------------------------------------------------------------------
+/architecture.md
