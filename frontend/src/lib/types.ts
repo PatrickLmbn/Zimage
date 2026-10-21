@@ -84,8 +84,16 @@ export interface HeadroomPrediction {
   encode_peak_gb: number
   /** Free VRAM left after the prompt-encode phase. */
   encode_free_gb: number
-  /** Whether the prompt-encode phase fits on the card right now. */
+  /**
+   * Whether the prompt-encode phase fits on the card right now. It always
+   * "fits" in the sense that the request succeeds -- the encoder falls back
+   * to the CPU when the GPU path does not fit.
+   */
   encode_fits: boolean
+  /** Whether the prompt encode will actually run on the GPU (fast path). */
+  encode_uses_gpu?: boolean
+  /** How long the prompt encode will take, in seconds. */
+  encode_seconds?: number
   /** Which phase sets the peak: "vae" or "transformer". */
   binding: "vae" | "transformer"
   verdict: "won't fit" | "very tight" | "tight" | "ok" | "comfortable"

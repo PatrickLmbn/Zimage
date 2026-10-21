@@ -309,13 +309,28 @@ def load_pipeline() -> None:
     # Warm the prompt-encode path. On a cold allocator the encoder's 2.7 GB
     # cannot find a contiguous block and the first real request falls back to
     # the ~17 s CPU encode. Doing one throwaway encode here makes the block
-    # resident so every request gets the ~2 s GPU path.
+    # resident so every request gets the ~1 s GPU path.
+    #
+    # NOTE: on this card the GPU encode usually does NOT fit at all -- the
+    # desktop holds ~1.2 GB and the encoder wants the rest. In that case the
+    # warmup falls back to the CPU too, and every request pays ~17 s. The
+    # log line below says which path is actually live, because "warmup done
+    # (GPU path resident)" used to be printed even when it had fallen back.
     try:
+        t0 = time.time()
         _ = encode_prompt("warmup")
         del _
         gc.collect()
         torch.cuda.empty_cache()
-        log("  prompt-encode warmup done (GPU path resident)")
+        encode_free = torch.cuda.mem_get_info(0)[0] / 1024**3
+        if encode_free >= 2.85:
+            log(f"  prompt-encode warmup done, GPU path resident ({encode_free:.2f} GB free)")
+        else:
+            log(
+                f"  prompt-encode warmup done, but the GPU path does not fit "
+                f"({encode_free:.2f} GB free, needs 2.85 GB) -- requests will use "
+                f"the CPU encode (~17 s each)"
+            )
     except Exception as exc:  # noqa: BLE001
         log(f"  warmup skipped: {type(exc).__name__}: {exc}")
 
@@ -591,7 +606,11 @@ def settings() -> dict[str, Any]:
         "blocks": [1],
         "active_blocks": ACTIVE_BLOCKS,
         "notes": {
-            "encode": "Text encoder runs on the GPU (~1s), staged in and out per request.",
+            "encode": (
+                "The prompt encoder wants the card to itself (~2.85 GB free). "
+                "If it does not fit it falls back to the CPU: the request still "
+                "works, but the encode takes ~17 s instead of ~1 s."
+            ),
             "vram": "One transformer block is resident in VRAM at a time (streamed prefetch).",
             "size": "Sizes must be a multiple of 16.",
         },
@@ -625,6 +644,9 @@ def headroom_endpoint(
             size, blocks, vram_total_gb=total, vram_used_gb=used, vram_free_gb=free
         )
         pred["explain"] = headroom.explain(size, blocks)
+        pred["explain_encode"] = headroom.explain_encode(
+            bool(pred.get("encode_uses_gpu")), free * 1024
+        )
         return pred
 
     grid = headroom.predict_all(

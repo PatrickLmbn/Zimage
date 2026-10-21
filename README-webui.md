@@ -58,11 +58,20 @@ cd frontend && npm run dev
   blocks, backend RSS).
 - **VRAM headroom preview.** Under the Resolution control, a panel shows what the
   current choice will cost: the predicted device-level VRAM peak, the free space
-  left afterwards, a verdict (comfortable / ok / tight / won't fit), and which
-  phase sets the peak. Backed by `backend/headroom.py`, a model calibrated on
-  this machine by measuring the real transformer forward and the real VAE
-  decode for every (size, blocks) combination. It reproduces the observed
-  production `peak_vram_gb` values exactly (worst error 2 MiB).
+  left afterwards, a verdict (comfortable / ok / tight / very tight / won't fit),
+  and which phase sets the peak. Backed by `backend/headroom.py`, a model
+  calibrated on this machine by measuring the real transformer forward and the
+  real VAE decode for every (size, blocks) combination. It reproduces the
+  observed production `peak_vram_gb` values exactly (worst error 2 MiB).
+- **The prompt encode never blocks a request.** The text encoder wants the
+  card almost to itself (~2.85 GB free). On this machine it usually does *not*
+  fit, because the desktop already holds ~1.2 GB. `encode_prompt()` catches
+  the OOM and falls back to a CPU encode, which always works and produces
+  identical embeddings — it just costs ~17 s instead of ~1 s. So the encode
+  affects request *speed*, never success. The headroom panel reports which
+  path will be used and never marks a working setting as "won't fit" because
+  of the encode. The verdict is driven by the generation phase, which is the
+  only thing that can actually fail.
 - **VRAM blocks control.** Removed. The streamed offload requires exactly one
   block per group, and measurements showed larger groups are slower, so the
   choice was always a no-op. The API still accepts `blocks` for compatibility

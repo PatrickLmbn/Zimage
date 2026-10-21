@@ -73,19 +73,17 @@ export function Headroom({
       </div>
 
       <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5 font-mono text-[11px] tabular-nums text-muted-foreground">
-        <span className={pred.encode_fits ? undefined : "text-destructive"}>
-          encode needs {pred.encode_peak_gb.toFixed(2)} GB
+        <span>
+          encode:{" "}
+          {pred.encode_uses_gpu ? "GPU" : "CPU"}
+          {pred.encode_seconds ? ` ~${Math.round(pred.encode_seconds)}s` : ""}
         </span>
-        <span className={pred.encode_fits ? undefined : "text-destructive"}>
-          free after: {pred.encode_free_gb.toFixed(2)} GB
+        <span>
+          {pred.encode_uses_gpu
+            ? `needs ${pred.encode_peak_gb.toFixed(2)} GB`
+            : "encoder won't fit — falls back"}
         </span>
       </div>
-
-      <p className="text-[11px] leading-relaxed text-muted-foreground/80">
-        {pred.binding === "vae"
-          ? "The VAE decode is the limit here, not the transformer — a larger resolution is what costs you, not the offload settings."
-          : "The transformer dominates, so a larger resolution is what costs you here."}
-      </p>
     </div>
   )
 }

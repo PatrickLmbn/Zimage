@@ -26,6 +26,12 @@ Two numbers matter and they answer different questions:
 Headroom must be judged against the DEVICE number, because that is what the
 card actually has. The torch number understates it by ~1.4 GB (CUDA context,
 cuBLAS/cuDNN workspaces, other apps, allocator cache).
+
+The prompt encode is a THIRD phase and it behaves differently from the other
+two: it does not have to fit. `encode_prompt()` catches the OOM and falls back
+to a CPU encode that always works and produces identical embeddings, just
+slower (~17 s instead of ~1 s). So the encode affects how FAST a request is,
+never whether it succeeds, and it must never drive the verdict to "won't fit".
 """
 
 from __future__ import annotations
@@ -78,18 +84,40 @@ _PACKED_BLOCK_MIB = 97.3  # packed weight of one transformer block
 #
 # The text encoder is 2.65 GB of packed INT4 and is staged ONTO the card for the
 # duration of the prompt encode (sdnq has CUDA kernels for it, so the encode
-# takes ~1 s there instead of ~16 s on the CPU). The VAE is moved off the card
+# takes ~1 s there instead of ~17 s on the CPU). The VAE is moved off the card
 # for that window, because the two do not fit together.
 #
-# So the encode phase has its own, INDEPENDENT device peak, and it does not
-# depend on resolution or block count at all -- it is a fixed cost of the
-# pipeline. Measured on this card: the encode OOMs with 2,738 MB free and
-# succeeds with 2,848 MB free, so it needs ~2.80 GB of headroom of its own.
+# The GPU encode needs the card ALMOST TO ITSELF. Measured on this card, one
+# process per trial:
 #
-# This is now the binding constraint on a 4 GB card: the encode phase needs
-# MORE VRAM than the generation phase (2.80 GB vs 0.77 GB), and it does not
-# care what resolution you picked.
-ENCODER_DEVICE_MIB: float = 2870.0  # ~2.80 GB
+#     free VRAM 2848 MB -> GPU encode OK in 1.04 s
+#     free VRAM 2738 MB -> OOM
+#     free VRAM 2697 MB -> OOM   (the normal state of the desktop)
+#
+# So the threshold sits in (2697, 2848] MB. On a 4 GB card whose desktop
+# already holds ~1.2 GB, the GPU encode usually does NOT fit.
+#
+# CRUCIALLY: the encode never fails the request. `encode_prompt()` catches the
+# OOM and falls back to the CPU encode, which always works and produces
+# identical embeddings -- it just costs ~17 s instead of ~1 s.
+#
+# So the encode must NEVER drive the verdict to "won't fit". It drives it to
+# "tight": the job will succeed, but the request will be slow.
+#
+# The generation phase is what actually decides whether the job fits.
+ENCODER_GPU_REQUIRED_FREE_MIB: float = 2850.0  # GPU encode needs this much free
+ENCODER_GPU_PEAK_MIB: float = 2800.0           # what the GPU encode occupies
+CPU_ENCODE_SECONDS: float = 17.0
+GPU_ENCODE_SECONDS: float = 1.0
+
+# One step down, for when the prompt encode has to fall back to the CPU.
+# "won't fit" and "very tight" are NOT downgraded: the CPU encode always
+# works, so it can never make a request impossible.
+_DOWNGRADE: dict[str, str] = {
+    "comfortable": "ok",
+    "ok": "tight",
+    "tight": "very tight",
+}
 
 
 def _lookup(table: dict, size: int, blocks: int) -> float:
@@ -135,11 +163,20 @@ def predict(size: int, blocks: int, *, vram_total_gb: float, vram_used_gb: float
 
     `vram_*_gb` are the CURRENT live readings from NVML (device-wide).
 
-    Two phases have to fit, and they are staged so they never overlap:
-      * the prompt encode (fixed ~2.80 GB, the text encoder on the card)
-      * the generation (transformer + VAE decode, depends on size/blocks)
-    The job fits only if BOTH fit, so the verdict is driven by the worse of the
-    two -- and the encode is usually the worse one on a 4 GB card.
+    A request has two phases:
+
+      * the prompt encode -- the text encoder wants the card to itself
+        (~2.85 GB free needed). It does NOT have to fit: `encode_prompt()`
+        catches the OOM and falls back to a CPU encode that always works and
+        gives identical embeddings, just slower (~17 s instead of ~1 s). So
+        the encode affects SPEED, never whether the job succeeds.
+
+      * the generation -- the transformer forward and the VAE decode, staged
+        so they never overlap. THIS is what decides whether the job fits.
+
+    So the verdict is driven by the generation phase. The encode only ever
+    pushes it from "comfortable" down to "tight" (slow request), never to
+    "won't fit".
     """
     torch_mib = torch_peak_mib(size, blocks)
     device_mib = device_peak_mib(size, blocks)
@@ -151,22 +188,36 @@ def predict(size: int, blocks: int, *, vram_total_gb: float, vram_used_gb: float
     vae_t = VAE_TORCH_MIB[size]
     binding = "vae" if vae_t > trf_t else "transformer"
 
-    # The encode phase is resolution-independent, so it binds on its own.
-    encode_free_gb = vram_free_gb - ENCODER_DEVICE_MIB / 1024
-    encode_fits = encode_free_gb > 0.0
+    # --- the encode phase: fast path or slow path? -------------------------
+    free_mib = vram_free_gb * 1024
+    encode_uses_gpu = free_mib >= ENCODER_GPU_REQUIRED_FREE_MIB
+    encode_seconds = GPU_ENCODE_SECONDS if encode_uses_gpu else CPU_ENCODE_SECONDS
+    encode_free_gb = round(
+        (free_mib - (ENCODER_GPU_PEAK_MIB if encode_uses_gpu else 0.0)) / 1024, 2
+    )
+    # The GPU encode fits on the card (or it falls back to the CPU and works
+    # anyway). Either way the request goes through.
+    encode_fits = True
 
-    if not encode_fits:
+    # --- the generation phase: this is what must fit -----------------------
+    if projected_free_gb <= 0.0:
         verdict = "won't fit"
-    elif projected_free_gb <= 0.0:
-        verdict = "won't fit"
-    elif projected_free_gb < 0.25 or encode_free_gb < 0.25:
+    elif projected_free_gb < 0.25:
         verdict = "very tight"
-    elif projected_free_gb < 0.6 or encode_free_gb < 0.6:
+    elif projected_free_gb < 0.6:
         verdict = "tight"
-    elif projected_free_gb < 1.2 and encode_free_gb < 1.2:
+    elif projected_free_gb < 1.2:
         verdict = "ok"
     else:
         verdict = "comfortable"
+
+    # A CPU encode still works, it is just slow. Downgrade the verdict ONE
+    # step so the request is not misreported as optimal -- but do not flatten
+    # every resolution to the same word, which would throw away the very
+    # signal the panel exists to show. It can never become "won't fit" here:
+    # the encode always succeeds via the CPU.
+    if not encode_uses_gpu:
+        verdict = _DOWNGRADE.get(verdict, verdict)
 
     return {
         "size": size,
@@ -175,12 +226,14 @@ def predict(size: int, blocks: int, *, vram_total_gb: float, vram_used_gb: float
         "device_peak_gb": round(device_mib / 1024, 3),
         "projected_used_gb": round(projected_used_gb, 2),
         "projected_free_gb": round(projected_free_gb, 2),
-        "encode_peak_gb": round(ENCODER_DEVICE_MIB / 1024, 3),
-        "encode_free_gb": round(encode_free_gb, 2),
+        "encode_peak_gb": round(ENCODER_GPU_PEAK_MIB / 1024, 3),
+        "encode_free_gb": encode_free_gb,
         "encode_fits": encode_fits,
+        "encode_uses_gpu": encode_uses_gpu,
+        "encode_seconds": encode_seconds,
         "binding": binding,
         "verdict": verdict,
-        "fits": projected_free_gb > 0.0 and encode_fits,
+        "fits": projected_free_gb > 0.0,
     }
 
 
@@ -204,4 +257,19 @@ def explain(size: int, blocks: int) -> str:
         f"{binding} dominates at {size}px / {blocks} block(s): "
         f"transformer {trf_t:.0f} MiB, VAE {vae_t:.0f} MiB, "
         f"device peak {device_peak_mib(size, blocks):.0f} MiB"
+    )
+
+
+def explain_encode(encode_uses_gpu: bool, free_mib: float) -> str:
+    """One-line explanation of what the prompt encode will cost."""
+    if encode_uses_gpu:
+        return (
+            f"Prompt encode on the GPU: ~{GPU_ENCODE_SECONDS:.0f} s "
+            f"({free_mib:.0f} MiB free is enough)."
+        )
+    return (
+        f"Prompt encode will fall back to the CPU: ~{CPU_ENCODE_SECONDS:.0f} s "
+        f"instead of ~{GPU_ENCODE_SECONDS:.0f} s. It needs "
+        f"{ENCODER_GPU_REQUIRED_FREE_MIB:.0f} MiB free and there is "
+        f"{free_mib:.0f} MiB. The request still works."
     )
