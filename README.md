@@ -14,11 +14,19 @@ VRAM/CPU/RAM telemetry, and browse the results in a gallery.
 ## How it works
 
 The model is loaded once at startup and kept resident, so requests skip the ~25 s load
-time. The text encoder stays on **CPU** (never touches VRAM); only the transformer uses
-group offload, with `num_blocks_per_group` reconfigured per request so just a few
-transformer blocks are resident on the GPU at a time. That keeps peak VRAM at ~0.77 GB
-instead of the ~4 GB the full model wants. One generation runs at a time behind a lock,
-since the GPU is a single shared resource.
+time. Two things make it fit on a 4 GB card:
+
+- **The text encoder stays in RAM but encodes on the GPU.** It is 2.65 GB of packed
+  INT4, which does not fit on the card alongside everything else, so it is staged in
+  and out around each request (`vae → CPU` → `encoder → GPU` → encode → back). On
+  the card the encode takes ~1 s instead of ~16 s on the CPU.
+- **The transformer streams one block at a time.** Only one of its 30 blocks is
+  resident in VRAM; the next is prefetched over PCIe on a side stream while the
+  current one computes. That keeps peak VRAM at ~0.77 GB instead of the ~3.2 GB the
+  full model wants.
+
+One generation runs at a time behind a lock, since the GPU is a single shared
+resource.
 
 ## Setup
 
@@ -41,12 +49,16 @@ Open **http://127.0.0.1:5173**.
 
 ## Performance on an RTX 2050 (16 GB RAM)
 
+Measured through the HTTP API, 8 steps @ 512 px:
+
 | Metric | Value |
 |---|---|
-| 8 steps @ 512px, 1 block | ~34 s (≈4.2 s/step) |
-| Peak VRAM | 0.77 GB |
-| Backend RSS | ~1.5 GB idle, ~5.9 GB under load |
-| Prompt encode | ~18 s (CPU) |
+| Full request | ~28 s |
+| Prompt encode (GPU) | ~2 s |
+| Generation | ~25 s (≈3.2 s/step) |
+| VAE decode | ~0.6 s |
+| Peak VRAM (generation) | 0.77 GB |
+| Backend RSS | ~1.6 GB idle, ~8.2 GB under load |
 
 ## API
 

@@ -72,10 +72,21 @@ export function Headroom({
         <span>tensors {pred.torch_peak_gb.toFixed(2)} GB</span>
       </div>
 
+      <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5 font-mono text-[11px] tabular-nums text-muted-foreground">
+        <span className={pred.encode_fits ? undefined : "text-destructive"}>
+          encode needs {pred.encode_peak_gb.toFixed(2)} GB
+        </span>
+        <span className={pred.encode_fits ? undefined : "text-destructive"}>
+          free after: {pred.encode_free_gb.toFixed(2)} GB
+        </span>
+      </div>
+
       <p className="text-[11px] leading-relaxed text-muted-foreground/80">
-        {pred.binding === "vae"
-          ? "The VAE decode is the limit here, not the transformer — raising VRAM blocks will not speed this up."
-          : "The transformer dominates, so raising VRAM blocks trades VRAM for speed."}
+        {!pred.encode_fits
+          ? "The prompt encoder alone does not fit on the card right now — close something else using VRAM, or the job will fail at the encode step."
+          : pred.binding === "vae"
+            ? "The VAE decode is the limit here, not the transformer — a larger resolution is what costs you, not the offload settings."
+            : "The transformer dominates, so a larger resolution is what costs you here."}
         {warn && " This is very close to the card limit."}
       </p>
     </div>

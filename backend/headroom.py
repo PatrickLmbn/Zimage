@@ -74,6 +74,23 @@ ALLOWED_BLOCKS: tuple[int, ...] = (1, 2, 3, 4)
 MAX_BLOCKS = 30
 _PACKED_BLOCK_MIB = 97.3  # packed weight of one transformer block
 
+# --- the prompt-encode phase -----------------------------------------------
+#
+# The text encoder is 2.65 GB of packed INT4 and is staged ONTO the card for the
+# duration of the prompt encode (sdnq has CUDA kernels for it, so the encode
+# takes ~1 s there instead of ~16 s on the CPU). The VAE is moved off the card
+# for that window, because the two do not fit together.
+#
+# So the encode phase has its own, INDEPENDENT device peak, and it does not
+# depend on resolution or block count at all -- it is a fixed cost of the
+# pipeline. Measured on this card: the encode OOMs with 2,738 MB free and
+# succeeds with 2,848 MB free, so it needs ~2.80 GB of headroom of its own.
+#
+# This is now the binding constraint on a 4 GB card: the encode phase needs
+# MORE VRAM than the generation phase (2.80 GB vs 0.77 GB), and it does not
+# care what resolution you picked.
+ENCODER_DEVICE_MIB: float = 2870.0  # ~2.80 GB
+
 
 def _lookup(table: dict, size: int, blocks: int) -> float:
     """Measured value, or a linear extrapolation in `blocks` outside the
@@ -117,6 +134,12 @@ def predict(size: int, blocks: int, *, vram_total_gb: float, vram_used_gb: float
     """Predict the VRAM outcome of a generation.
 
     `vram_*_gb` are the CURRENT live readings from NVML (device-wide).
+
+    Two phases have to fit, and they are staged so they never overlap:
+      * the prompt encode (fixed ~2.80 GB, the text encoder on the card)
+      * the generation (transformer + VAE decode, depends on size/blocks)
+    The job fits only if BOTH fit, so the verdict is driven by the worse of the
+    two -- and the encode is usually the worse one on a 4 GB card.
     """
     torch_mib = torch_peak_mib(size, blocks)
     device_mib = device_peak_mib(size, blocks)
@@ -128,13 +151,19 @@ def predict(size: int, blocks: int, *, vram_total_gb: float, vram_used_gb: float
     vae_t = VAE_TORCH_MIB[size]
     binding = "vae" if vae_t > trf_t else "transformer"
 
-    if projected_free_gb <= 0.0:
+    # The encode phase is resolution-independent, so it binds on its own.
+    encode_free_gb = vram_free_gb - ENCODER_DEVICE_MIB / 1024
+    encode_fits = encode_free_gb > 0.0
+
+    if not encode_fits:
         verdict = "won't fit"
-    elif projected_free_gb < 0.25:
+    elif projected_free_gb <= 0.0:
+        verdict = "won't fit"
+    elif projected_free_gb < 0.25 or encode_free_gb < 0.25:
         verdict = "very tight"
-    elif projected_free_gb < 0.6:
+    elif projected_free_gb < 0.6 or encode_free_gb < 0.6:
         verdict = "tight"
-    elif projected_free_gb < 1.2:
+    elif projected_free_gb < 1.2 and encode_free_gb < 1.2:
         verdict = "ok"
     else:
         verdict = "comfortable"
@@ -146,9 +175,12 @@ def predict(size: int, blocks: int, *, vram_total_gb: float, vram_used_gb: float
         "device_peak_gb": round(device_mib / 1024, 3),
         "projected_used_gb": round(projected_used_gb, 2),
         "projected_free_gb": round(projected_free_gb, 2),
+        "encode_peak_gb": round(ENCODER_DEVICE_MIB / 1024, 3),
+        "encode_free_gb": round(encode_free_gb, 2),
+        "encode_fits": encode_fits,
         "binding": binding,
         "verdict": verdict,
-        "fits": projected_free_gb > 0.0,
+        "fits": projected_free_gb > 0.0 and encode_fits,
     }
 
 

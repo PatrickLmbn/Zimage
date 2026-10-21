@@ -14,6 +14,10 @@ export interface Job {
   metrics: {
     generation_seconds: number
     seconds_per_step: number
+    /** Prompt encode time (GPU) for this job. */
+    encode_seconds?: number
+    /** encode + generation. */
+    total_seconds?: number
     peak_vram_gb: number
     rss_mb: number
     seed: number
@@ -76,6 +80,12 @@ export interface HeadroomPrediction {
   device_peak_gb: number
   projected_used_gb: number
   projected_free_gb: number
+  /** Peak whole-card VRAM for the prompt-encode phase (text encoder on the GPU). */
+  encode_peak_gb: number
+  /** Free VRAM left after the prompt-encode phase. */
+  encode_free_gb: number
+  /** Whether the prompt-encode phase fits on the card right now. */
+  encode_fits: boolean
   /** Which phase sets the peak: "vae" or "transformer". */
   binding: "vae" | "transformer"
   verdict: "won't fit" | "very tight" | "tight" | "ok" | "comfortable"

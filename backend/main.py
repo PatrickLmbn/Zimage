@@ -20,6 +20,26 @@ Design constraints (RTX 2050 4 GB VRAM / 16 GB RAM, ~7 GB RAM actually free):
     and OOMs the 4 GB card. The text encoder is therefore offloaded separately
     with its own CPU placement, and only the transformer uses group offload.
 
+  * PROMPT ENCODING RUNS ON THE GPU. The text encoder is 2.65 GB of packed INT4
+    and sdnq has CUDA kernels for it, so it encodes in ~0.8 s on the card versus
+    ~16-18 s on the CPU. It cannot stay there: the VAE decode needs its own
+    activation peak and the two together do not fit in 4 GB. So the encoder is
+    staged in and out around each request:
+        1. vae   -> CPU      (frees 160 MB)
+        2. encoder -> GPU    (needs ~2.7 GB free)
+        3. encode
+        4. encoder -> CPU    (releases 2.7 GB)
+        5. vae   -> GPU
+    Measured: a full 8-step 512px request drops from ~70 s to ~30 s.
+
+  * GROUP OFFLOAD USES A STREAM. `use_stream=True` lets diffusers prefetch the
+    next block group over PCIe while the current one computes, which cuts
+    generation from ~4.5 s/step to ~3.5 s/step. `low_cpu_mem_usage=True` is
+    required alongside it: without it diffusers keeps a second PINNED CPU copy
+    of every weight (+3.25 GB), which does swap on this box. With it, the
+    pinned copy is made on the fly and peak RSS is LOWER than the no-stream
+    path (measured 4.2 GB vs 6.3 GB, swap delta ~0).
+
   * Prompt encoding uses DYNAMIC padding. The stock pipeline pads to 512 tokens;
     a typical prompt is only ~16-30 tokens, and padding to 512 makes the CPU
     encode take 64 s instead of 17 s for identical output.
@@ -91,6 +111,10 @@ class GenerateRequest(BaseModel):
     size: int = Field(default=512)
     seed: int = Field(default=-1, ge=-1, le=2**31 - 1)
     guidance: float = Field(default=0.0, ge=0.0, le=20.0)
+    # Accepted for API compatibility but ignored: the streamed group offload
+    # requires exactly one block per group (diffusers overrides anything
+    # larger), and measurements showed larger groups are SLOWER anyway
+    # (1 block 3.94-4.17 s/step, 3 blocks 4.95-5.46, 4 blocks 4.74-4.95).
     blocks: int = Field(default=1, ge=1, le=8)
 
 
@@ -186,9 +210,17 @@ def set_block_offload(num_blocks: int) -> None:
 
     diffusers registers one `group_offloading` hook per block group, so changing
     the group size means removing every existing hook and re-applying the
-    offload with the new `num_blocks_per_group`. Verified: with 30 transformer
-    blocks the per-group block count tracks the request exactly (1 -> 1,
-    2 -> 2, 4 -> 2/4, 8 -> 6/8).
+    offload with the new `num_blocks_per_group`.
+
+    The stream is ON: it lets diffusers prefetch the next group over PCIe while
+    the current one computes, which is the difference between ~4.5 s/step and
+    ~3.5 s/step on this card. `low_cpu_mem_usage=True` is what makes that safe
+    here -- without it diffusers keeps a second pinned CPU copy of every weight
+    (+3.25 GB) and this box swaps. With it, the pinned copy is made on the fly,
+    so peak RSS is actually LOWER than the no-stream path.
+
+    Note: diffusers forces `num_blocks_per_group=1` when a stream is used, so
+    the block count is effectively always 1 on this configuration.
 
     Must only be called while the GPU lock is held, or between jobs.
     """
@@ -212,13 +244,14 @@ def set_block_offload(num_blocks: int) -> None:
         offload_device=torch.device("cpu"),
         offload_type="block_level",
         num_blocks_per_group=num_blocks,
-        use_stream=False,
+        use_stream=True,
+        low_cpu_mem_usage=True,
     )
     ACTIVE_BLOCKS = num_blocks
     gc.collect()
     malloc_trim()
     torch.cuda.empty_cache()
-    log(f"  group offload reconfigured -> {num_blocks} block(s) per group")
+    log(f"  group offload reconfigured -> {num_blocks} block(s) per group (streamed)")
 
 
 def load_pipeline() -> None:
@@ -239,9 +272,10 @@ def load_pipeline() -> None:
     )
     log(f"  pipeline loaded in {time.time() - t0:.1f}s  RSS={rss_mb():.0f} MB")
 
-    # The text encoder stays on CPU for the whole session: it is the same cost
-    # whether we load it now or per-request, and keeping it resident removes an
-    # ~18 s load from every request.
+    # The text encoder stays resident in RAM for the whole session: it is the
+    # same cost whether we load it now or per-request, and keeping it resident
+    # removes an ~18 s load from every request. It is moved to the GPU only for
+    # the duration of the encode (see encode_prompt) and moved straight back.
     log("  loading text encoder (CPU, resident) ...")
     t0 = time.time()
     TOKENIZER = AutoTokenizer.from_pretrained(str(MODEL_DIR / "tokenizer"))
@@ -253,14 +287,16 @@ def load_pipeline() -> None:
 
     # Block-offload the transformer: only N blocks live in VRAM at a time.
     # Apply this to the TRANSFORMER ONLY. `pipe.enable_group_offload(...)` would
-    # sweep every component, dragging the 2.65 GB text encoder onto the GPU and
-    # OOMing the 4 GB card. And `exclude_modules` does not help: it means "keep
+    # sweep every component and drag the 2.65 GB text encoder onto the GPU and
+    # OOM the 4 GB card. And `exclude_modules` does not help: it means "keep
     # this on the accelerator", not "skip this one".
     set_block_offload(1)
-    # The VAE is small (160 MB) and its decode is the activation peak -> keep it
-    # on the GPU permanently. The text encoder stays on the CPU.
-    PIPE.vae.to("cuda")
-    log("  transformer group-offloaded, vae on cuda, text encoder on cpu")
+    # The VAE is small (160 MB) but its decode is the activation peak of the
+    # whole pipeline, so it is kept OFF the card between requests and staged in
+    # only for the decode. Leaving it resident would eat into the prompt
+    # encode's headroom, which is the tightest moment in the request.
+    PIPE.vae.to("cpu")
+    log("  transformer group-offloaded (streamed), vae on cpu, text encoder on cpu")
 
     gc.collect()
     malloc_trim()
@@ -270,9 +306,22 @@ def load_pipeline() -> None:
         f"VRAM free={torch.cuda.mem_get_info(0)[0] / 1024**3:.2f} GB"
     )
 
+    # Warm the prompt-encode path. On a cold allocator the encoder's 2.7 GB
+    # cannot find a contiguous block and the first real request falls back to
+    # the ~17 s CPU encode. Doing one throwaway encode here makes the block
+    # resident so every request gets the ~2 s GPU path.
+    try:
+        _ = encode_prompt("warmup")
+        del _
+        gc.collect()
+        torch.cuda.empty_cache()
+        log("  prompt-encode warmup done (GPU path resident)")
+    except Exception as exc:  # noqa: BLE001
+        log(f"  warmup skipped: {type(exc).__name__}: {exc}")
 
-def encode_prompt(text: str) -> "torch.Tensor":
-    """Encode a prompt on CPU with dynamic padding (no pad to 512)."""
+
+def _encode_text(text: str, device: str) -> "torch.Tensor":
+    """Run the encode on `device`. Caller manages where the encoder lives."""
     templated = TOKENIZER.apply_chat_template(
         [{"role": "user", "content": text}],
         tokenize=False,
@@ -285,7 +334,7 @@ def encode_prompt(text: str) -> "torch.Tensor":
         truncation=True,
         max_length=512,
         return_tensors="pt",
-    )
+    ).to(device)
     mask = inputs.attention_mask.bool()
     with torch.no_grad():
         out = TEXT_ENCODER(
@@ -294,6 +343,89 @@ def encode_prompt(text: str) -> "torch.Tensor":
             output_hidden_states=True,
         )
     return out.hidden_states[-2][0][mask[0]].clone()
+
+
+def encode_prompt(text: str) -> "torch.Tensor":
+    """Encode a prompt, preferring the GPU but falling back to the CPU.
+
+    The text encoder is 2.7 GB of packed INT4. On the CPU it takes 16-18 s per
+    request; sdnq has CUDA kernels for it, so on the card it takes ~1 s.
+
+    On the GPU it is a very close fit: 2.7 GB of weights plus sdnq's ~48 MB
+    per-layer dequantisation buffer, on a card that only has ~3.7 GB usable
+    after the CUDA context and any other process. Whether that fits depends on
+    what else is on the card at the time, so the encode is attempted on the GPU
+    and falls back to the CPU rather than failing the request. The fallback
+    costs ~15 s, but it is correct, and it keeps the fast path whenever the
+    card has room.
+
+    The VAE is kept on the CPU between requests: it is staged in for the decode
+    instead, so the encoder gets the whole card for this phase.
+
+    The caller must hold the GPU lock.
+    """
+    if TEXT_ENCODER is None:
+        raise RuntimeError("text encoder not loaded")
+
+    # Make sure nothing else of ours is holding VRAM. NOTE: no empty_cache()
+    # here. Releasing the cached segment forces the encoder's 2.7 GB to come
+    # from a fresh driver allocation, which fragments on this card and makes
+    # the encode OOM; reusing the existing cached block is what lets it fit.
+    PIPE.vae.to("cpu")
+    torch.cuda.synchronize()
+
+    try:
+        TEXT_ENCODER.to("cuda")
+        torch.cuda.synchronize()
+        try:
+            embeds = _encode_text(text, "cuda")
+        finally:
+            TEXT_ENCODER.to("cpu")
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        return embeds
+    except (torch.OutOfMemoryError, RuntimeError) as exc:
+        # RuntimeError covers the device-mismatch that sdnq raises when a
+        # partial move leaves some layers behind after a failed .to("cuda").
+        if not isinstance(exc, torch.OutOfMemoryError) and "out of memory" not in str(exc).lower():
+            raise
+        log(f"  GPU prompt encode OOM ({type(exc).__name__}), falling back to CPU")
+        gc.collect()
+        malloc_trim()
+        torch.cuda.empty_cache()
+        TEXT_ENCODER.to("cpu")
+        torch.cuda.synchronize()
+        return _encode_text(text, "cpu")
+
+
+def decode_latents(latents: "torch.Tensor") -> Any:
+    """Decode latents to a PIL image, staging the VAE onto the card.
+
+    The VAE is 160 MB and its decode is the activation peak of the whole
+    pipeline, so it is kept off the card between requests and staged in only
+    for the decode. It shares the card with nothing else at this point: the
+    text encoder has already gone back to the CPU and the transformer's blocks
+    are offloaded one at a time.
+
+    `torch.no_grad()` is essential here. The pipeline's own `__call__` is
+    decorated with it, so its decode runs without an autograd graph. Decoding
+    by hand without it builds a graph that holds EVERY VAE activation alive
+    (2.76 GB instead of 174 MB) and the decode OOMs on a 4 GB card.
+    """
+    PIPE.vae.to("cuda")
+    torch.cuda.synchronize()
+    try:
+        with torch.no_grad():
+            latents = latents.to(PIPE.vae.dtype)
+            latents = (latents / PIPE.vae.config.scaling_factor) + PIPE.vae.config.shift_factor
+            image = PIPE.vae.decode(latents, return_dict=False)[0]
+            # postprocess returns a LIST of images (one per batch element).
+            out = PIPE.image_processor.postprocess(image, output_type="pil")
+            return out[0] if isinstance(out, list) else out
+    finally:
+        PIPE.vae.to("cpu")
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
 
 class _JobCancelled(Exception):
@@ -309,22 +441,18 @@ def run_generation(job: Job, req: GenerateRequest) -> None:
             job.started_at = time.time()
             job.stage = "encoding prompt"
             job.progress = 0.05
-            log(f"job {job.id}: encoding prompt ({len(req.prompt)} chars)")
+            log(f"job {job.id}: encoding prompt on GPU ({len(req.prompt)} chars)")
 
+            t_enc = time.perf_counter()
             embeds = encode_prompt(req.prompt)
+            encode_s = time.perf_counter() - t_enc
+            log(f"job {job.id}: prompt encoded in {encode_s:.2f}s")
             job.stage = "generating"
             job.progress = 0.2
 
-            # Apply the requested VRAM block count. Reconfiguring the offload
-            # is cheap (it only re-registers hooks) but must not happen while
-            # another job is using the GPU, so it happens under the lock.
-            if req.blocks != ACTIVE_BLOCKS:
-                job.stage = "configuring VRAM blocks"
-                try:
-                    set_block_offload(req.blocks)
-                except Exception as exc:  # noqa: BLE001
-                    log(f"job {job.id}: block reconfigure failed: {exc}")
-                    set_block_offload(1)
+            # The block count is fixed at 1: the streamed group offload requires
+            # it, and larger groups measured slower anyway. Nothing to
+            # reconfigure per request.
 
             seed = (
                 req.seed
@@ -354,17 +482,30 @@ def run_generation(job: Job, req: GenerateRequest) -> None:
                 guidance_scale=req.guidance,
                 generator=torch.Generator("cpu").manual_seed(seed),
                 callback_on_step_end=on_step,
+                # Return the latents and decode ourselves, so the VAE can be
+                # staged onto the card only for the decode. Letting the
+                # pipeline decode would require the VAE to be resident the
+                # whole time, which is what squeezes the prompt encode.
+                output_type="latent",
             )
             gen_s = time.time() - t0
 
+            # The decode is a separate phase with its own activation peak.
+            t_dec = time.perf_counter()
+            image = decode_latents(result.images)
+            decode_s = time.perf_counter() - t_dec
+
             out_path = OUT_DIR / f"web_{job.id}.png"
-            result.images[0].save(out_path)
+            image.save(out_path)
 
             peak_vram = torch.cuda.max_memory_allocated(0) / 1024**3
             job.image_url = f"/api/image/{job.id}"
             job.metrics = {
                 "generation_seconds": round(gen_s, 2),
                 "seconds_per_step": round(gen_s / max(req.steps, 1), 2),
+                "encode_seconds": round(encode_s, 2),
+                "decode_seconds": round(decode_s, 2),
+                "total_seconds": round(encode_s + gen_s + decode_s, 2),
                 "peak_vram_gb": round(peak_vram, 3),
                 "rss_mb": round(rss_mb()),
                 "seed": seed,
@@ -379,7 +520,11 @@ def run_generation(job: Job, req: GenerateRequest) -> None:
             job.progress = 1.0
             job.state = "done"
             job.stage = "done"
-            log(f"job {job.id}: done in {gen_s:.1f}s  peakVRAM={peak_vram:.2f} GB")
+            log(
+                f"job {job.id}: done in {gen_s:.1f}s "
+                f"(encode {encode_s:.1f}s, decode {decode_s:.1f}s)  "
+                f"peakVRAM={peak_vram:.2f} GB"
+            )
 
     except _JobCancelled:
         job.state = "error"
@@ -443,11 +588,11 @@ def settings() -> dict[str, Any]:
         "default_size": 512,
         "default_steps": 8,
         "max_steps": 50,
-        "blocks": [1, 2, 3, 4],
+        "blocks": [1],
         "active_blocks": ACTIVE_BLOCKS,
         "notes": {
-            "encode": "Text encoder runs on CPU (~17s) and stays resident.",
-            "vram": "Only N transformer blocks are resident in VRAM at a time.",
+            "encode": "Text encoder runs on the GPU (~1s), staged in and out per request.",
+            "vram": "One transformer block is resident in VRAM at a time (streamed prefetch).",
             "size": "Sizes must be a multiple of 16.",
         },
     }

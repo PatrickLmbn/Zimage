@@ -7,14 +7,22 @@ RTX 2050 4 GB VRAM, ~2.8 GB VRAM actually free, ~6.8 GB RAM free):
   * The INT4 transformer is 3.25 GB packed -> it does NOT fit in VRAM, and it does
     not fit in RAM alongside the text encoder (3.25 + 2.65 = 5.9 GB).
   * So components are staged, never all resident at once:
-        1. text encoder  -> CPU, encode the prompt, then FREE it
-        2. transformer   -> CPU (packed INT4), block-offloaded to VRAM a few blocks
-                            at a time
+        1. text encoder  -> CPU, moved to the GPU only for the encode (sdnq has
+                            CUDA kernels for it, so the encode takes ~1 s on the
+                            card instead of ~16 s on the CPU), then FREE it
+        2. transformer   -> CPU (packed INT4), block-offloaded to VRAM one block
+                            at a time with the next prefetched over PCIe
         3. vae           -> GPU (160 MB, fp32 upcast to 320 MB), decode the latents
-  * Group offload runs with use_stream=False ON PURPOSE. With use_stream=True,
-    diffusers keeps a second PINNED CPU copy of every weight (+3.25 GB RAM) and this
-    box has only ~6.8 GB free. Without a stream there is exactly ONE copy of each
-    weight, living in either RAM or VRAM.
+  * Group offload runs with use_stream=True and low_cpu_mem_usage=True. The
+    stream lets diffusers prefetch the next block group while the current one
+    computes (~3.3 s/step instead of ~4.5 s/step). low_cpu_mem_usage is what
+    makes that affordable on a box with ~6.8 GB free: without it diffusers keeps
+    a second PINNED CPU copy of every weight (+3.25 GB RAM) and this box swaps.
+    With it the pinned copy is made on the fly, so peak RSS is LOWER than the
+    no-stream path (measured 4.2 GB vs 6.3 GB, swap delta ~0).
+  * num_blocks_per_group is fixed at 1: the streamed offload requires it, and
+    larger groups measured SLOWER anyway (1 block 3.94-4.17 s/step, 3 blocks
+    4.95-5.46, 4 blocks 4.74-4.95).
   * Default resolution is 512x512, not the model's 1024x1024, because a 1024x1024
     latent is 64x64 -> 4096 tokens and the unified attention sequence (tokens + 512
     caption tokens) pushes activation memory past what is left of the 4 GB card.

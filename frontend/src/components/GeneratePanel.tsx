@@ -92,7 +92,6 @@ export function GeneratePanel({
   const [prompt, setPrompt] = useState(PRESETS[0])
   const [steps, setSteps] = useState(8)
   const [size, setSize] = useState(512)
-  const [blocks, setBlocks] = useState(1)
   const [seed, setSeed] = useState(-1)
   const [busy, setBusy] = useState(false)
   const [job, setJob] = useState<Job | null>(null)
@@ -188,7 +187,6 @@ export function GeneratePanel({
           size,
           seed,
           guidance: 0,
-          blocks,
         }),
       })
       if (!res.ok) {
@@ -228,7 +226,7 @@ export function GeneratePanel({
         metrics: null,
       })
     }
-  }, [prompt, steps, size, seed, blocks, busy, setActive, onJobState])
+  }, [prompt, steps, size, seed, busy, setActive, onJobState])
 
   // Stop: asks the backend to abort. A running job stops at the next step
   // boundary; a queued job is cancelled immediately.
@@ -265,7 +263,7 @@ export function GeneratePanel({
       <div className="flex flex-col gap-2">
         <FieldLabel
           htmlFor="prompt"
-          hint="The description of the image you want. The text encoder turns this into conditioning tokens for the transformer. Longer, more descriptive prompts usually give more detail — but the encode runs on CPU and takes ~18s, so very long prompts cost a few extra seconds."
+          hint="The description of the image you want. The text encoder turns this into conditioning tokens for the transformer. Longer, more descriptive prompts usually give more detail. The encode runs on the GPU and takes about a second, so prompt length barely affects the wait."
         >
           Prompt
         </FieldLabel>
@@ -297,49 +295,27 @@ export function GeneratePanel({
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-4">
-        <div className="flex flex-col gap-2">
-          <FieldLabel
-            hint="Width and height of the output in pixels. Bigger means more detail but much more VRAM and time — on this 4GB card 512 is the safe maximum, and each step gets slower as this grows."
-          >
-            Resolution
-          </FieldLabel>
-          <Select value={String(size)} onValueChange={(v) => setSize(Number(v))} disabled={busy}>
-            <SelectTrigger className="w-full">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {sizes.map((s) => (
-                <SelectItem key={s} value={String(s)}>
-                  {s} × {s}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-
-        <div className="flex flex-col gap-2">
-          <FieldLabel
-            hint="How many transformer blocks are moved into VRAM at once. More blocks = fewer CPU↔GPU swaps = faster generation, but more VRAM. 1 is the safest for this 4GB card; raise it only if you have VRAM headroom."
-          >
-            VRAM blocks
-          </FieldLabel>
-          <Select value={String(blocks)} onValueChange={(v) => setBlocks(Number(v))} disabled={busy}>
-            <SelectTrigger className="w-full">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {(settings?.blocks ?? [1, 2, 3, 4]).map((b) => (
-                <SelectItem key={b} value={String(b)}>
-                  {b} {b === 1 ? "block" : "blocks"}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
+      <div className="flex flex-col gap-2">
+        <FieldLabel
+          hint="Width and height of the output in pixels. Bigger means more detail but much more VRAM and time — on this 4GB card 512 is the safe maximum, and each step gets slower as this grows."
+        >
+          Resolution
+        </FieldLabel>
+        <Select value={String(size)} onValueChange={(v) => setSize(Number(v))} disabled={busy}>
+          <SelectTrigger className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {sizes.map((s) => (
+              <SelectItem key={s} value={String(s)}>
+                {s} × {s}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </div>
 
-      <Headroom size={size} blocks={blocks} />
+      <Headroom size={size} blocks={1} />
 
       <div className="flex flex-col gap-3">
         <div className="flex items-center justify-between">
@@ -423,7 +399,7 @@ export function GeneratePanel({
           <Progress value={job.progress * 100} />
           {job.metrics && (
             <p className="font-mono text-[11px] tabular-nums text-muted-foreground">
-              {job.metrics.generation_seconds}s total ·{" "}
+              {job.metrics.total_seconds ?? job.metrics.generation_seconds}s total ·{" "}
               {job.metrics.seconds_per_step}s/step · seed {job.metrics.seed}
             </p>
           )}
@@ -521,7 +497,7 @@ export function GalleryGrid({
                   <DialogDescription className="font-mono text-[11px] tabular-nums">
                     {item.metrics.size}px · {item.metrics.steps} steps ·{" "}
                     {item.metrics.seconds_per_step}s/step
-                    {item.metrics.blocks ? ` · ${item.metrics.blocks} blk` : ""} ·{" "}
+                    {item.metrics.total_seconds ? ` · ${item.metrics.total_seconds}s total` : ""} ·{" "}
                     {item.metrics.peak_vram_gb}GB VRAM
                   </DialogDescription>
                 )}
@@ -546,7 +522,7 @@ export function GalleryGrid({
               <p className="font-mono text-[11px] text-muted-foreground tabular-nums">
                 {item.metrics.size}px · {item.metrics.steps} steps ·{" "}
                 {item.metrics.seconds_per_step}s/step
-                {item.metrics.blocks ? ` · ${item.metrics.blocks} blk` : ""} ·{" "}
+                {item.metrics.total_seconds ? ` · ${item.metrics.total_seconds}s total` : ""} ·{" "}
                 {item.metrics.peak_vram_gb}GB VRAM
               </p>
             ) : (
